@@ -133,7 +133,15 @@ class split_space_NGPModel():
             )
         )
                 
-        self.field = TCNNNerfactoField(
+        self.field_00 = TCNNNerfactoField(
+            aabb=self.scene_box_00.aabb,
+            num_images=self.num_train_data,
+            log2_hashmap_size=self.config.log2_hashmap_size,
+            max_res=self.config.max_res,
+            spatial_distortion=scene_contraction,
+        )
+
+        self.field_01 = TCNNNerfactoField(
             aabb=self.scene_box_01.aabb,
             num_images=self.num_train_data,
             log2_hashmap_size=self.config.log2_hashmap_size,
@@ -141,7 +149,7 @@ class split_space_NGPModel():
             spatial_distortion=scene_contraction,
         )
 
-        self.field = TCNNNerfactoField(
+        self.field_10 = TCNNNerfactoField(
             aabb=self.scene_box_10.aabb,
             num_images=self.num_train_data,
             log2_hashmap_size=self.config.log2_hashmap_size,
@@ -149,23 +157,7 @@ class split_space_NGPModel():
             spatial_distortion=scene_contraction,
         )
 
-        self.field = TCNNNerfactoField(
-            aabb=self.scene_box_01.aabb,
-            num_images=self.num_train_data,
-            log2_hashmap_size=self.config.log2_hashmap_size,
-            max_res=self.config.max_res,
-            spatial_distortion=scene_contraction,
-        )
-
-        self.field = TCNNNerfactoField(
-            aabb=self.scene_box_10.aabb,
-            num_images=self.num_train_data,
-            log2_hashmap_size=self.config.log2_hashmap_size,
-            max_res=self.config.max_res,
-            spatial_distortion=scene_contraction,
-        )
-
-        self.field = TCNNNerfactoField(
+        self.field_11 = TCNNNerfactoField(
             aabb=self.scene_box_11.aabb,
             num_images=self.num_train_data,
             log2_hashmap_size=self.config.log2_hashmap_size,
@@ -179,8 +171,9 @@ class split_space_NGPModel():
         self.scene_aabb_11 = Parameter(self.scene_box_11.aabb.flatten(), requires_grad=False)
 
         if self.config.render_step_size is None:
-            # auto step size: ~1000 samples in the base level grid
+            # auto step size: ~1000 samples in the base level grid in a split space
             self.config.render_step_size = ((self.scene_aabb_00[3:] - self.scene_aabb_00[:3]) ** 2).sum().sqrt().item() / 1000
+
         # Occupancy Grid.
         self.occupancy_grid_00 = nerfacc.OccGridEstimator(
             roi_aabb=self.scene_aabb_00,
@@ -206,20 +199,20 @@ class split_space_NGPModel():
         # Sampler
         self.sampler_00 = VolumetricSampler(
             occupancy_grid=self.occupancy_grid_00,
-            density_fn=self.field.density_fn,
+            density_fn=self.field_00.density_fn,
         )
 
         self.sampler_01 = VolumetricSampler(
             occupancy_grid=self.occupancy_grid_01,
-            density_fn=self.field.density_fn,
+            density_fn=self.field_01.density_fn,
         )
         self.sampler_10 = VolumetricSampler(
             occupancy_grid=self.occupancy_grid_10,
-            density_fn=self.field.density_fn,
+            density_fn=self.field_10.density_fn,
         )
         self.sampler_11 = VolumetricSampler(
             occupancy_grid=self.occupancy_grid_11,
-            density_fn=self.field.density_fn,
+            density_fn=self.field_11.density_fn,
         )
 
         # renderers
@@ -241,19 +234,19 @@ class split_space_NGPModel():
         def update_occupancy_grid(step: int):
             self.occupancy_grid_00.update_every_n_steps(
                 step=step,
-                occ_eval_fn=lambda x: self.field.density_fn(x) * self.config.render_step_size,
+                occ_eval_fn=lambda x: self.field_00.density_fn(x) * self.config.render_step_size,
             )
             self.occupancy_grid_01.update_every_n_steps(
                 step=step,
-                occ_eval_fn=lambda x: self.field.density_fn(x) * self.config.render_step_size,
+                occ_eval_fn=lambda x: self.field_01.density_fn(x) * self.config.render_step_size,
             )
             self.occupancy_grid_10.update_every_n_steps(
                 step=step,
-                occ_eval_fn=lambda x: self.field.density_fn(x) * self.config.render_step_size,
+                occ_eval_fn=lambda x: self.field_10.density_fn(x) * self.config.render_step_size,
             )
             self.occupancy_grid_11.update_every_n_steps(
                 step=step,
-                occ_eval_fn=lambda x: self.field.density_fn(x) * self.config.render_step_size,
+                occ_eval_fn=lambda x: self.field_11.density_fn(x) * self.config.render_step_size,
             )
 
         return [
@@ -266,9 +259,9 @@ class split_space_NGPModel():
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
-        if self.field is None:
+        if self.field_00 is None or self.field_01 is None or self.field_10 is None or self.field_11 is None  :
             raise ValueError("populate_fields() must be called before get_param_groups")
-        param_groups["fields"] = list(self.field.parameters())
+        param_groups["fields"] = list(self.field_00.parameters() + self.field_01.parameters() + self.field_10.parameters() + self.field_11.parameters())
         return param_groups
 
     def get_outputs(self, ray_bundle: RayBundle):
@@ -276,7 +269,35 @@ class split_space_NGPModel():
         num_rays = len(ray_bundle)
 
         with torch.no_grad():
-            ray_samples, ray_indices = self.sampler(
+            #此处需要根据不同的field取得不同的sample结果
+            ray_samples, ray_indices = self.sampler_00(
+                ray_bundle=ray_bundle,
+                near_plane=self.config.near_plane,
+                far_plane=self.config.far_plane,
+                render_step_size=self.config.render_step_size,
+                alpha_thre=self.config.alpha_thre,
+                cone_angle=self.config.cone_angle,
+            )
+
+            ray_samples, ray_indices = self.sampler_01(
+                ray_bundle=ray_bundle,
+                near_plane=self.config.near_plane,
+                far_plane=self.config.far_plane,
+                render_step_size=self.config.render_step_size,
+                alpha_thre=self.config.alpha_thre,
+                cone_angle=self.config.cone_angle,
+            )
+
+            ray_samples, ray_indices = self.sampler_10(
+                ray_bundle=ray_bundle,
+                near_plane=self.config.near_plane,
+                far_plane=self.config.far_plane,
+                render_step_size=self.config.render_step_size,
+                alpha_thre=self.config.alpha_thre,
+                cone_angle=self.config.cone_angle,
+            )
+
+            ray_samples, ray_indices = self.sampler_11(
                 ray_bundle=ray_bundle,
                 near_plane=self.config.near_plane,
                 far_plane=self.config.far_plane,
